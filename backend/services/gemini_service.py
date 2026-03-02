@@ -13,8 +13,9 @@ load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 
-# Use Flash for speed + free tier
-_model = genai.GenerativeModel("gemini-1.5-flash")
+# Model priority: try best available, fall back automatically
+# gemini-flash-lite-latest = alias that always points to the latest working flash lite
+_model = genai.GenerativeModel("gemini-flash-lite-latest")
 
 
 def _call_gemini(prompt: str) -> str:

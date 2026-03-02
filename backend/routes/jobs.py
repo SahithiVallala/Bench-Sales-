@@ -14,9 +14,44 @@ from services.job_search import google_cse, jsearch, remotive
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 # Which API handles which platform
-CSE_PLATFORMS      = {"naukri", "dice", "glassdoor"}
-JSEARCH_PLATFORMS  = {"linkedin", "indeed", "ziprecruiter"}
+# Note: Glassdoor is served via JSearch because Google search only returns
+# Glassdoor category listing pages (individual jobs require login/JS).
+# JSearch surfaces Glassdoor-published jobs via its job_publisher field.
+CSE_PLATFORMS      = {"naukri", "dice"}
+JSEARCH_PLATFORMS  = {"linkedin", "indeed", "ziprecruiter", "glassdoor"}
 REMOTIVE_PLATFORMS = {"remotive"}
+
+
+def _keyword_score(title: str, description: str, candidate_role: str, candidate_skills: list) -> dict:
+    """
+    Fast keyword-based fallback scorer — used when Gemini quota is exceeded.
+    Counts how many candidate skills appear in the job text.
+    """
+    text = (title + " " + description).lower()
+    role_match = bool(candidate_role) and candidate_role.lower() in text
+
+    matched = [s for s in candidate_skills if s.lower() in text]
+    missing = [s for s in candidate_skills if s.lower() not in text]
+
+    if candidate_skills:
+        score = int(len(matched) / len(candidate_skills) * 100)
+        if role_match:
+            score = min(100, score + 10)
+        summary = f"Keyword match: {len(matched)}/{len(candidate_skills)} skills found in job description."
+    elif candidate_role:
+        score   = 65 if role_match else 35
+        summary = "Job title matches candidate role." if role_match else "Role mismatch with job title."
+    else:
+        # No resume data to score against — neutral
+        score   = 50
+        summary = "Resume not yet parsed — upload and parse resume for accurate scoring."
+
+    return {
+        "match_score":    score,
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "summary":        summary,
+    }
 
 
 @router.post("/search", response_model=JobSearchResponse)
@@ -49,7 +84,14 @@ async def search_jobs(req: JobSearchRequest):
     jsearch_platforms  = [p for p in platforms_selected if p in JSEARCH_PLATFORMS]
     include_remotive   = "remotive" in platforms_selected
 
-    results_per_platform = max(5, req.num_results // max(len(platforms_selected), 1))
+    # Each CSE platform (Naukri/Dice/Glassdoor) searches a different site,
+    # so give each the full num_results — no overlap expected between them.
+    # JSearch is called ONCE for all selected platforms combined; request extra
+    # so publisher-based filtering still leaves enough after dedup.
+    # Remotive gets its own share.
+    cse_per_platform   = req.num_results          # each site is unique
+    jsearch_total      = req.num_results * 3      # request 3× so filtering doesn't leave too few
+    remotive_per_call  = max(10, req.num_results)
 
     # 3. Build async tasks for all platforms
     tasks = []
@@ -61,15 +103,17 @@ async def search_jobs(req: JobSearchRequest):
             locations=req.locations,
             work_mode=req.work_mode.value,
             job_type=req.job_type.value,
+            experience_level=req.experience_level.value,
             include_keywords=req.include_keywords,
             exclude_keywords=req.exclude_keywords,
             date_posted=req.date_posted.value,
-            num_results=results_per_platform
+            num_results=cse_per_platform
         ))
 
-    for platform in jsearch_platforms:
-        tasks.append(jsearch.search_platform(
-            platform=platform,
+    # ONE JSearch call for all selected platforms — avoids duplicate queries
+    if jsearch_platforms:
+        tasks.append(jsearch.search_platforms_combined(
+            platforms=jsearch_platforms,
             job_titles=req.job_titles,
             locations=req.locations,
             work_mode=req.work_mode.value,
@@ -78,7 +122,7 @@ async def search_jobs(req: JobSearchRequest):
             include_keywords=req.include_keywords,
             exclude_keywords=req.exclude_keywords,
             date_posted=req.date_posted.value,
-            num_results=results_per_platform
+            num_results=jsearch_total
         ))
 
     if include_remotive:
@@ -86,24 +130,34 @@ async def search_jobs(req: JobSearchRequest):
             job_titles=req.job_titles,
             include_keywords=req.include_keywords,
             exclude_keywords=req.exclude_keywords,
-            num_results=results_per_platform
+            date_posted=req.date_posted.value,
+            num_results=remotive_per_call
         ))
 
     # 4. Run all searches in parallel
     all_platform_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 5. Merge + deduplicate by job_url
-    raw_jobs = []
+    # 5. Merge + deduplicate — interleave across platforms for diversity.
+    #    Round-robin: take 1 job from each platform in turns so that results
+    #    from every platform appear even when scores are equal.
     seen_urls = set()
+    platform_lists = []
     for platform_results in all_platform_results:
         if isinstance(platform_results, Exception):
             print(f"[Search] Platform error: {platform_results}")
             continue
-        for job in platform_results:
-            url = job.get("job_url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw_jobs.append(job)
+        platform_lists.append(platform_results)
+
+    raw_jobs = []
+    max_len = max((len(pl) for pl in platform_lists), default=0)
+    for i in range(max_len):
+        for pl in platform_lists:
+            if i < len(pl):
+                job = pl[i]
+                url = job.get("job_url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    raw_jobs.append(job)
 
     if not raw_jobs:
         return JobSearchResponse(
@@ -113,16 +167,18 @@ async def search_jobs(req: JobSearchRequest):
             searched_at=datetime.now(timezone.utc)
         )
 
-    # 6. Score each job against resume with Gemini (in parallel, batched)
+    # 6. Score ALL collected jobs so results from every platform are ranked fairly.
+    #    (Truncating before scoring would cause only the first platform's jobs to appear.)
     scored_jobs = await _score_jobs_parallel(
-        raw_jobs[:req.num_results],
+        raw_jobs,
         candidate_role,
         candidate_skills,
         experience_years
     )
 
-    # 7. Sort by match score descending
+    # 7. Sort by match score descending, then take top num_results
     scored_jobs.sort(key=lambda j: j.get("match_score", 0), reverse=True)
+    scored_jobs = scored_jobs[:req.num_results]
 
     # 8. Save to jobs_cache + job_assignments
     saved_jobs = await _save_jobs_to_cache(
@@ -149,23 +205,29 @@ async def _score_jobs_parallel(
 
     async def score_one(job: dict) -> dict:
         async with semaphore:
-            desc = job.get("description", "") or ""
+            desc  = job.get("description", "") or ""
             title = job.get("title", "")
-            if not desc and not title:
-                job["match_score"] = 0
-                job["match_reasons"] = {}
-                return job
 
-            loop = asyncio.get_event_loop()
-            score_data = await loop.run_in_executor(
-                None,
-                gemini_service.score_job_match,
-                title,
-                desc,
-                candidate_role,
-                candidate_skills,
-                experience_years
-            )
+            # Try Gemini first; fall back to keyword scoring on quota/error
+            try:
+                loop = asyncio.get_event_loop()
+                score_data = await loop.run_in_executor(
+                    None,
+                    gemini_service.score_job_match,
+                    title, desc, candidate_role, candidate_skills, experience_years
+                )
+                # Gemini silently returns score=0 when quota is exceeded — detect and fall back
+                gemini_failed = (
+                    score_data.get("match_score", 0) == 0
+                    and not score_data.get("matched_skills")
+                    and "unable to score" in (score_data.get("summary", "")).lower()
+                )
+                if gemini_failed:
+                    raise RuntimeError("Gemini quota exceeded — using keyword scorer")
+            except Exception as e:
+                print(f"[Score] Gemini unavailable ({e}), using keyword fallback")
+                score_data = _keyword_score(title, desc, candidate_role, candidate_skills)
+
             job["match_score"]   = score_data.get("match_score", 0)
             job["match_reasons"] = {
                 "matched_skills": score_data.get("matched_skills", []),

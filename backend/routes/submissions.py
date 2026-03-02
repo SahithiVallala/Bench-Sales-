@@ -27,6 +27,18 @@ async def create_submission(body: SubmissionCreate):
     """Create a new submission and generate AI content (note + pitch)."""
     supabase = get_supabase()
 
+    # Prevent duplicate: if same resume+job_url already exists, return it
+    if body.job_url:
+        existing = supabase.table("submissions") \
+            .select("id") \
+            .eq("resume_id", body.resume_id) \
+            .eq("job_url", body.job_url) \
+            .execute()
+        if existing.data:
+            existing_full = supabase.table("submissions_detail") \
+                .select("*").eq("id", existing.data[0]["id"]).single().execute()
+            return existing_full.data or existing.data[0]
+
     # Fetch resume for AI generation
     resume_result = supabase.table("resumes") \
         .select("candidate_name, primary_role, primary_skills, "

@@ -1,7 +1,6 @@
 'use client'
 import { useState, useEffect, Suspense } from 'react'
-import { useSearchParams, useRouter } from 'next/navigation'
-import Link from 'next/link'
+import { useSearchParams } from 'next/navigation'
 import { apiFetch } from '@/lib/api'
 
 interface Resume { id: string; candidate_name: string; primary_role: string | null }
@@ -21,6 +20,10 @@ interface JobResult {
   match_score: number | null
   match_reasons: { matched_skills: string[]; missing_skills: string[]; summary: string } | null
 }
+
+const STORAGE_RESULTS  = 'jobSearch_results'
+const STORAGE_FORM     = 'jobSearch_form'
+const STORAGE_APPLIED  = 'jobSearch_applied'
 
 const PLATFORMS = [
   { id: 'linkedin',     label: 'LinkedIn' },
@@ -42,9 +45,7 @@ const SCORE_COLOR = (s: number) =>
 
 function SearchPageInner() {
   const searchParams = useSearchParams()
-  const router = useRouter()
   const preselectedResumeId = searchParams.get('resume_id') || ''
-  const preselectedName = searchParams.get('name') || ''
 
   const [resumes, setResumes] = useState<Resume[]>([])
   const [results, setResults] = useState<JobResult[]>([])
@@ -53,23 +54,68 @@ function SearchPageInner() {
   const [error, setError] = useState<string | null>(null)
   const [expandedJob, setExpandedJob] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState<string | null>(null)
+  const [appliedUrls, setAppliedUrls] = useState<Set<string>>(new Set())
+  const [successMsg, setSuccessMsg] = useState<string | null>(null)
   const [minScore, setMinScore] = useState(0)
 
   // Form state
-  const [resumeId, setResumeId] = useState(preselectedResumeId)
-  const [jobTitles, setJobTitles] = useState<string[]>([])
-  const [titleInput, setTitleInput] = useState('')
-  const [platforms, setPlatforms] = useState<string[]>(['linkedin', 'indeed', 'dice', 'naukri'])
-  const [location, setLocation] = useState('')
-  const [jobType, setJobType] = useState('any')
-  const [workMode, setWorkMode] = useState('any')
-  const [expLevel, setExpLevel] = useState('any')
-  const [datePosted, setDatePosted] = useState('week')
-  const [numResults, setNumResults] = useState(20)
+  const [resumeId, setResumeId]       = useState(preselectedResumeId)
+  const [jobTitles, setJobTitles]     = useState<string[]>([])
+  const [titleInput, setTitleInput]   = useState('')
+  const [platforms, setPlatforms]     = useState<string[]>(['linkedin', 'indeed', 'dice', 'naukri'])
+  const [location, setLocation]       = useState('')
+  const [jobType, setJobType]         = useState('any')
+  const [workMode, setWorkMode]       = useState('any')
+  const [expLevel, setExpLevel]       = useState('any')
+  const [datePosted, setDatePosted]   = useState('week')
+  const [numResults, setNumResults]   = useState(20)
 
+  // On mount: restore results + form from sessionStorage
   useEffect(() => {
     apiFetch('/api/resumes?limit=100').then(setResumes).catch(console.error)
+
+    try {
+      const savedResults = sessionStorage.getItem(STORAGE_RESULTS)
+      const savedForm    = sessionStorage.getItem(STORAGE_FORM)
+
+      if (savedResults) {
+        setResults(JSON.parse(savedResults))
+        setSearched(true)
+      }
+      const savedApplied = sessionStorage.getItem(STORAGE_APPLIED)
+      if (savedApplied) {
+        setAppliedUrls(new Set(JSON.parse(savedApplied)))
+      }
+      if (savedForm) {
+        const f = JSON.parse(savedForm)
+        if (f.resumeId)   setResumeId(f.resumeId)
+        if (f.jobTitles)  setJobTitles(f.jobTitles)
+        if (f.platforms)  setPlatforms(f.platforms)
+        if (f.location)   setLocation(f.location)
+        if (f.jobType)    setJobType(f.jobType)
+        if (f.workMode)   setWorkMode(f.workMode)
+        if (f.expLevel)   setExpLevel(f.expLevel)
+        if (f.datePosted) setDatePosted(f.datePosted)
+        if (f.numResults) setNumResults(f.numResults)
+      }
+    } catch {
+      // ignore stale/corrupt sessionStorage
+    }
   }, [])
+
+  const saveToSession = (jobs: JobResult[]) => {
+    sessionStorage.setItem(STORAGE_RESULTS, JSON.stringify(jobs))
+    sessionStorage.setItem(STORAGE_FORM, JSON.stringify({
+      resumeId, jobTitles, platforms, location,
+      jobType, workMode, expLevel, datePosted, numResults,
+    }))
+  }
+
+  const clearSession = () => {
+    sessionStorage.removeItem(STORAGE_RESULTS)
+    sessionStorage.removeItem(STORAGE_FORM)
+    sessionStorage.removeItem(STORAGE_APPLIED)
+  }
 
   const addTitle = () => {
     const t = titleInput.trim()
@@ -82,13 +128,16 @@ function SearchPageInner() {
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!resumeId) { setError('Please select a candidate first.'); return }
+    if (!resumeId)           { setError('Please select a candidate first.'); return }
     if (jobTitles.length === 0) { setError('Please add at least one job title.'); return }
     if (platforms.length === 0) { setError('Please select at least one platform.'); return }
 
     setSearching(true)
     setError(null)
     setResults([])
+    setAppliedUrls(new Set())
+    setSuccessMsg(null)
+    clearSession()
 
     try {
       const body = {
@@ -106,8 +155,47 @@ function SearchPageInner() {
         method: 'POST',
         body: JSON.stringify(body),
       })
-      setResults(data.jobs || [])
+      const jobs = data.jobs || []
+      setResults(jobs)
       setSearched(true)
+      saveToSession(jobs)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  // Refresh = clear cache and re-run with same params
+  const handleRefresh = async () => {
+    if (!resumeId || jobTitles.length === 0 || platforms.length === 0) return
+    clearSession()
+    setResults([])
+    setAppliedUrls(new Set())
+    setSuccessMsg(null)
+    setSearching(true)
+    setError(null)
+
+    try {
+      const body = {
+        resume_id: resumeId,
+        job_titles: jobTitles,
+        platforms,
+        locations: location ? [location] : null,
+        job_type: jobType,
+        work_mode: workMode,
+        experience_level: expLevel,
+        date_posted: datePosted,
+        num_results: numResults,
+      }
+      const data = await apiFetch('/api/jobs/search', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const jobs = data.jobs || []
+      setResults(jobs)
+      setSearched(true)
+      saveToSession(jobs)
     } catch (err: any) {
       setError(err.message)
     } finally {
@@ -118,6 +206,8 @@ function SearchPageInner() {
   const handleSubmit = async (job: JobResult) => {
     if (!resumeId) return
     setSubmitting(job.job_url)
+    setSuccessMsg(null)
+
     try {
       await apiFetch('/api/submissions', {
         method: 'POST',
@@ -130,9 +220,14 @@ function SearchPageInner() {
           job_url: job.job_url,
         }),
       })
-      // Open job in new tab for manual apply
+      // Mark as applied, persist to sessionStorage, open job in new tab
+      setAppliedUrls(prev => {
+        const next = new Set(prev).add(job.job_url)
+        sessionStorage.setItem(STORAGE_APPLIED, JSON.stringify([...next]))
+        return next
+      })
+      setSuccessMsg(`Tracked! "${job.title}" added to your submissions.`)
       window.open(job.job_url, '_blank')
-      router.push('/submissions')
     } catch (err: any) {
       alert('Failed to log submission: ' + err.message)
     } finally {
@@ -283,7 +378,8 @@ function SearchPageInner() {
 
         {/* Results */}
         <div className="col-span-3 space-y-4">
-          {/* Score filter */}
+
+          {/* Results header with score filter + refresh */}
           {searched && results.length > 0 && (
             <div className="card flex items-center gap-4">
               <span className="text-sm text-gray-400 shrink-0">Min match: <span className="text-white font-medium">{minScore}%</span></span>
@@ -291,6 +387,26 @@ function SearchPageInner() {
                 onChange={e => setMinScore(Number(e.target.value))}
                 className="flex-1 accent-blue-500" />
               <span className="text-sm text-gray-400 shrink-0">{filtered.length} of {results.length} jobs</span>
+              <button
+                onClick={handleRefresh}
+                disabled={searching}
+                title="Fetch fresh results from all platforms"
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 border border-gray-600 hover:border-gray-500 rounded-lg transition-colors disabled:opacity-50">
+                <span className={searching ? 'animate-spin' : ''}>⟳</span> Refresh
+              </button>
+            </div>
+          )}
+
+          {/* Success toast */}
+          {successMsg && (
+            <div className="flex items-center justify-between px-4 py-3 bg-emerald-950/60 border border-emerald-800 rounded-lg text-sm text-emerald-300">
+              <span>✓ {successMsg}</span>
+              <div className="flex items-center gap-3 ml-4">
+                <a href="/submissions" className="text-emerald-400 hover:text-emerald-200 underline underline-offset-2 text-xs whitespace-nowrap">
+                  View Submissions →
+                </a>
+                <button onClick={() => setSuccessMsg(null)} className="text-emerald-500 hover:text-emerald-300 text-lg leading-none">×</button>
+              </div>
             </div>
           )}
 
@@ -317,88 +433,100 @@ function SearchPageInner() {
           )}
 
           {/* Job cards */}
-          {!searching && filtered.map(job => (
-            <div key={job.job_url} className="card hover:border-gray-600 transition-colors">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-base">{PLATFORM_ICONS[job.platform] || '💼'}</span>
-                    <span className="text-xs text-gray-500 capitalize">{job.platform}</span>
-                    {job.posted_date && <span className="text-xs text-gray-600">· {job.posted_date}</span>}
-                  </div>
-                  <h3 className="font-semibold text-white text-base leading-tight truncate">{job.title}</h3>
-                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-400 mt-1">
-                    {job.company && <span>🏢 {job.company}</span>}
-                    {job.location && <span>📍 {job.location}</span>}
-                    {job.work_mode && job.work_mode !== 'null' && <span>🏠 {job.work_mode}</span>}
-                    {job.job_type && job.job_type !== 'null' && <span>⏰ {job.job_type.replace('_', '-')}</span>}
-                    {job.salary_range && <span>💰 {job.salary_range}</span>}
-                  </div>
-                </div>
-
-                {/* Match score */}
-                <div className="text-center shrink-0">
-                  <div className={`text-2xl font-bold ${SCORE_COLOR(job.match_score ?? 0)}`}>
-                    {job.match_score ?? '—'}
-                  </div>
-                  <div className="text-xs text-gray-500">match%</div>
-                </div>
-              </div>
-
-              {/* Match details (expandable) */}
-              {job.match_reasons?.summary && (
-                <div className="mt-3 pt-3 border-t border-gray-800">
-                  <p className="text-xs text-gray-400 leading-relaxed">{job.match_reasons.summary}</p>
-                  {expandedJob === job.job_url && (
-                    <div className="mt-2 grid grid-cols-2 gap-2">
-                      {job.match_reasons.matched_skills?.length > 0 && (
-                        <div>
-                          <p className="text-xs text-emerald-400 font-medium mb-1">✓ Matched</p>
-                          <div className="flex flex-wrap gap-1">
-                            {job.match_reasons.matched_skills.map(s => (
-                              <span key={s} className="text-xs px-1.5 py-0.5 bg-emerald-900/30 text-emerald-400 rounded">{s}</span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {job.match_reasons.missing_skills?.length > 0 && (
-                        <div>
-                          <p className="text-xs text-red-400 font-medium mb-1">✗ Missing</p>
-                          <div className="flex flex-wrap gap-1">
-                            {job.match_reasons.missing_skills.map(s => (
-                              <span key={s} className="text-xs px-1.5 py-0.5 bg-red-900/30 text-red-400 rounded">{s}</span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                      {job.description && (
-                        <div className="col-span-2 mt-2">
-                          <p className="text-xs text-gray-500 leading-relaxed line-clamp-3">{job.description}</p>
-                        </div>
+          {!searching && filtered.map(job => {
+            const isApplied = appliedUrls.has(job.job_url)
+            return (
+              <div key={job.job_url} className={`card hover:border-gray-600 transition-colors ${isApplied ? 'border-emerald-900/60' : ''}`}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-base">{PLATFORM_ICONS[job.platform] || '💼'}</span>
+                      <span className="text-xs text-gray-500 capitalize">{job.platform}</span>
+                      {job.posted_date && <span className="text-xs text-gray-600">· {job.posted_date}</span>}
+                      {isApplied && (
+                        <span className="px-1.5 py-0.5 bg-emerald-900/40 text-emerald-400 text-xs rounded-full border border-emerald-800/50">
+                          Applied ✓
+                        </span>
                       )}
                     </div>
-                  )}
-                  <button onClick={() => setExpandedJob(expandedJob === job.job_url ? null : job.job_url)}
-                    className="text-xs text-blue-400 hover:text-blue-300 mt-1.5 transition-colors">
-                    {expandedJob === job.job_url ? 'Show less ↑' : 'Show more ↓'}
+                    <h3 className="font-semibold text-white text-base leading-tight truncate">{job.title}</h3>
+                    <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-400 mt-1">
+                      {job.company && <span>🏢 {job.company}</span>}
+                      {job.location && <span>📍 {job.location}</span>}
+                      {job.work_mode && job.work_mode !== 'null' && <span>🏠 {job.work_mode}</span>}
+                      {job.job_type && job.job_type !== 'null' && <span>⏰ {job.job_type.replace('_', '-')}</span>}
+                      {job.salary_range && <span>💰 {job.salary_range}</span>}
+                    </div>
+                  </div>
+
+                  {/* Match score */}
+                  <div className="text-center shrink-0">
+                    <div className={`text-2xl font-bold ${SCORE_COLOR(job.match_score ?? 0)}`}>
+                      {job.match_score ?? '—'}
+                    </div>
+                    <div className="text-xs text-gray-500">match%</div>
+                  </div>
+                </div>
+
+                {/* Match details (expandable) */}
+                {job.match_reasons?.summary && (
+                  <div className="mt-3 pt-3 border-t border-gray-800">
+                    <p className="text-xs text-gray-400 leading-relaxed">{job.match_reasons.summary}</p>
+                    {expandedJob === job.job_url && (
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        {job.match_reasons.matched_skills?.length > 0 && (
+                          <div>
+                            <p className="text-xs text-emerald-400 font-medium mb-1">✓ Matched</p>
+                            <div className="flex flex-wrap gap-1">
+                              {job.match_reasons.matched_skills.map(s => (
+                                <span key={s} className="text-xs px-1.5 py-0.5 bg-emerald-900/30 text-emerald-400 rounded">{s}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {job.match_reasons.missing_skills?.length > 0 && (
+                          <div>
+                            <p className="text-xs text-red-400 font-medium mb-1">✗ Missing</p>
+                            <div className="flex flex-wrap gap-1">
+                              {job.match_reasons.missing_skills.map(s => (
+                                <span key={s} className="text-xs px-1.5 py-0.5 bg-red-900/30 text-red-400 rounded">{s}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {job.description && (
+                          <div className="col-span-2 mt-2">
+                            <p className="text-xs text-gray-500 leading-relaxed line-clamp-3">{job.description}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <button onClick={() => setExpandedJob(expandedJob === job.job_url ? null : job.job_url)}
+                      className="text-xs text-blue-400 hover:text-blue-300 mt-1.5 transition-colors">
+                      {expandedJob === job.job_url ? 'Show less ↑' : 'Show more ↓'}
+                    </button>
+                  </div>
+                )}
+
+                {/* Actions */}
+                <div className="flex gap-2 mt-3 pt-3 border-t border-gray-800">
+                  <a href={job.job_url} target="_blank" rel="noreferrer"
+                    className="flex-1 text-center py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded-lg transition-colors">
+                    View Job ↗
+                  </a>
+                  <button onClick={() => handleSubmit(job)}
+                    disabled={submitting === job.job_url || isApplied}
+                    className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                      isApplied
+                        ? 'bg-emerald-900/40 text-emerald-400 border border-emerald-800/50 cursor-default'
+                        : 'bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white'
+                    }`}>
+                    {submitting === job.job_url ? '...' : isApplied ? 'Applied ✓' : 'Apply & Track →'}
                   </button>
                 </div>
-              )}
-
-              {/* Actions */}
-              <div className="flex gap-2 mt-3 pt-3 border-t border-gray-800">
-                <a href={job.job_url} target="_blank" rel="noreferrer"
-                  className="flex-1 text-center py-1.5 text-xs font-medium text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded-lg transition-colors">
-                  View Job ↗
-                </a>
-                <button onClick={() => handleSubmit(job)}
-                  disabled={submitting === job.job_url}
-                  className="flex-1 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-lg transition-colors">
-                  {submitting === job.job_url ? '...' : 'Apply & Track →'}
-                </button>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>
