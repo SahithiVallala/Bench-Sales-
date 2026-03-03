@@ -14,6 +14,29 @@ from services import gemini_service
 router = APIRouter(prefix="/api/resumes", tags=["resumes"])
 
 
+@router.post("/extract-contact")
+async def extract_contact(file: UploadFile = File(...)):
+    """
+    Lightweight endpoint: extract just name, email, phone from a resume file.
+    Called client-side on file select to auto-populate the Candidate Info form
+    before the user submits the full upload.
+    """
+    fname = file.filename.lower()
+    if not (fname.endswith(".pdf") or fname.endswith(".docx") or fname.endswith(".doc")):
+        raise HTTPException(400, "Only PDF and Word (.docx) files are supported")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "File too large (max 10 MB)")
+
+    parsed_text = extract_text_from_file(file_bytes, file.filename)
+    if not parsed_text:
+        return {"full_name": None, "email": None, "phone": None, "location": None}
+
+    contact = gemini_service.extract_contact_info(parsed_text)
+    return contact
+
+
 @router.post("")
 async def upload_resume(
     file:             UploadFile = File(...),
@@ -57,14 +80,31 @@ async def upload_resume(
     if not parsed_text:
         raise HTTPException(422, "Could not extract text from file. Ensure it is not scanned/image-only.")
 
-    # 3. AI parsing
+    # 3. AI parsing — now also extracts full_name, email, phone
     extracted = gemini_service.parse_resume(parsed_text)
+
+    # Use regex as additional safety net for email/phone
+    import re
+    if not email:
+        m = re.search(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', parsed_text)
+        email = m.group(0).lower() if m else None
+    if not phone:
+        m = re.search(
+            r'(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}|\+\d{1,3}[\s.\-]?\d{6,12})',
+            parsed_text
+        )
+        phone = m.group(0).strip() if m else None
+
+    # Fall back to AI-extracted name if the form sent an empty/placeholder name
+    effective_name = candidate_name.strip() or extracted.get("full_name") or candidate_name
+    effective_email = email or extracted.get("email")
+    effective_phone = phone or extracted.get("phone")
 
     # 4. Save to DB
     record = {
-        "candidate_name":   candidate_name,
-        "email":            email,
-        "phone":            phone,
+        "candidate_name":   effective_name,
+        "email":            effective_email,
+        "phone":            effective_phone,
         "visa_status":      visa_status,
         "work_auth":        work_auth,
         "current_location": current_location,

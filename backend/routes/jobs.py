@@ -2,6 +2,8 @@
 Job Search routes — multi-platform search with AI match scoring
 """
 import asyncio
+import math
+import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from typing import List
@@ -54,6 +56,105 @@ def _keyword_score(title: str, description: str, candidate_role: str, candidate_
     }
 
 
+# Title words that indicate seniority / junior level (lowercase)
+_SENIOR_WORDS = {"senior", "sr", "lead", "principal", "staff", "director",
+                 "manager", "architect", "vp", "head", "chief", "distinguished"}
+_JUNIOR_WORDS = {"junior", "jr", "entry", "associate", "intern",
+                 "trainee", "graduate", "fresher", "beginner"}
+
+
+def _extract_min_years(text: str) -> int | None:
+    """
+    Extract the minimum years of experience REQUIRED by the job.
+    Returns None if no clear requirement found.
+
+    Only matches patterns that unambiguously refer to candidate requirements,
+    NOT company descriptions like "We have 20 years of experience".
+
+    Safe patterns:
+      - "5+ years"                    → 5   (almost always a requirement)
+      - "minimum 4 years"             → 4
+      - "at least 7 years"            → 7
+      - "3-5 years required"          → 3
+      - "requires 5 years"            → 5
+
+    Intentionally NOT matched (too many false positives):
+      - "X years of experience"  ← also appears in company bio sections
+      - "X-Y years"              ← appears in "founded 10-15 years ago"
+    """
+    t = text.lower()
+
+    # "minimum X years" / "at least X years" / "minimum of X years"
+    m = re.search(r'(?:minimum|at\s+least|minimum\s+of)\s+(\d{1,2})\s*\+?\s*years?', t)
+    if m:
+        return int(m.group(1))
+
+    # "requires/required X years"
+    m = re.search(r'require[sd]?\s+(\d{1,2})\s*\+?\s*years?', t)
+    if m:
+        return int(m.group(1))
+
+    # "X+ years" — the plus sign makes this almost always a job requirement
+    m = re.search(r'\b(\d{1,2})\+\s*years?', t)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def _experience_matches(job: dict, experience_level: str) -> bool:
+    """
+    Returns True if the job's required experience matches the selected level.
+    Only hard-excludes jobs that clearly exceed the selected range.
+
+    Ranges:
+      entry  = 0-2 years
+      mid    = 2-5 years
+      senior = 5+ years
+    """
+    if experience_level == "any":
+        return True
+
+    title = (job.get("title", "") or "").lower()
+    desc  = (job.get("description", "") or "").lower()
+    text  = title + " " + desc
+
+    min_yrs = _extract_min_years(text)
+
+    title_tokens = set(re.split(r'[\s,./\-]+', title))
+    is_senior_title = bool(title_tokens & _SENIOR_WORDS)
+    is_junior_title = bool(title_tokens & _JUNIOR_WORDS)
+
+    if experience_level == "entry":
+        # Exclude jobs requiring 3+ years
+        if min_yrs is not None and min_yrs >= 3:
+            return False
+        # Exclude jobs with senior/lead titles (unless also tagged junior — rare edge case)
+        if is_senior_title and not is_junior_title:
+            return False
+        return True
+
+    elif experience_level == "mid":
+        # Exclude jobs requiring 6+ years (senior territory)
+        if min_yrs is not None and min_yrs >= 6:
+            return False
+        # Exclude obvious intern/trainee roles
+        if is_junior_title and not is_senior_title and min_yrs is None:
+            return False
+        return True
+
+    elif experience_level == "senior":
+        # Exclude clearly entry/intern roles when no year requirement found
+        if is_junior_title and not is_senior_title and min_yrs is None:
+            return False
+        # Exclude jobs explicitly requiring < 2 years
+        if min_yrs is not None and min_yrs < 2:
+            return False
+        return True
+
+    return True
+
+
 @router.post("/search", response_model=JobSearchResponse)
 async def search_jobs(req: JobSearchRequest):
     """
@@ -84,17 +185,28 @@ async def search_jobs(req: JobSearchRequest):
     jsearch_platforms  = [p for p in platforms_selected if p in JSEARCH_PLATFORMS]
     include_remotive   = "remotive" in platforms_selected
 
-    # Each CSE platform (Naukri/Dice/Glassdoor) searches a different site,
-    # so give each the full num_results — no overlap expected between them.
-    # JSearch is called ONCE for all selected platforms combined; request extra
-    # so publisher-based filtering still leaves enough after dedup.
-    # Remotive gets its own share.
-    cse_per_platform   = req.num_results          # each site is unique
-    jsearch_total      = req.num_results * 3      # request 3× so filtering doesn't leave too few
-    remotive_per_call  = max(10, req.num_results)
+    # Per-platform quota: divide requested jobs equally across all selected platforms.
+    total_platforms = len(cse_platforms) + len(jsearch_platforms) + (1 if include_remotive else 0)
+    per_platform    = math.ceil(req.num_results / total_platforms) if total_platforms else req.num_results
 
-    # 3. Build async tasks for all platforms
-    tasks = []
+    # Fetch much more than needed — URL filters, publisher filters and dedup all reduce counts.
+    # CSE capped at 50: Serper returns 10/page, 5 pages max = 50 results per platform.
+    # JSearch: 5× per platform because publisher filtering leaves ~30-40% after dedup.
+    cse_per_platform  = min(per_platform * 6, 50)
+    jsearch_total     = per_platform * max(len(jsearch_platforms), 1) * 5
+    remotive_per_call = max(20, per_platform * 3)
+
+    print(f"\n{'='*60}")
+    print(f"[Search] platforms={platforms_selected} num_results={req.num_results}")
+    print(f"[Search] per_platform={per_platform}  cse_fetch={cse_per_platform}  "
+          f"jsearch_fetch={jsearch_total}  remotive_fetch={remotive_per_call}")
+    print(f"{'='*60}")
+
+    # 3. Build async tasks; track which platform(s) each task covers.
+    #    task_platform[i] = platform name for single-platform tasks,
+    #    or None for JSearch (which returns multiple platforms in one call).
+    tasks         = []
+    task_platform = []
 
     for platform in cse_platforms:
         tasks.append(google_cse.search_platform(
@@ -109,8 +221,10 @@ async def search_jobs(req: JobSearchRequest):
             date_posted=req.date_posted.value,
             num_results=cse_per_platform
         ))
+        task_platform.append(platform)
 
-    # ONE JSearch call for all selected platforms — avoids duplicate queries
+    # ONE JSearch call for all selected platforms — avoids duplicate queries.
+    # Each job already carries a "platform" field set by _parse_job.
     if jsearch_platforms:
         tasks.append(jsearch.search_platforms_combined(
             platforms=jsearch_platforms,
@@ -124,6 +238,7 @@ async def search_jobs(req: JobSearchRequest):
             date_posted=req.date_posted.value,
             num_results=jsearch_total
         ))
+        task_platform.append(None)  # multi-platform; trust job["platform"] field
 
     if include_remotive:
         tasks.append(remotive.search_remote_jobs(
@@ -133,31 +248,59 @@ async def search_jobs(req: JobSearchRequest):
             date_posted=req.date_posted.value,
             num_results=remotive_per_call
         ))
+        task_platform.append("remotive")
 
     # 4. Run all searches in parallel
     all_platform_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # 5. Merge + deduplicate — interleave across platforms for diversity.
-    #    Round-robin: take 1 job from each platform in turns so that results
-    #    from every platform appear even when scores are equal.
+    # 5. Bucket raw jobs by platform + deduplicate.
+    #    CSE results belong to one platform (tracked via task_platform).
+    #    JSearch results carry a "platform" field per job.
+    #    Remotive results are all tagged "remotive".
     seen_urls = set()
-    platform_lists = []
-    for platform_results in all_platform_results:
+    buckets: dict = {p: [] for p in platforms_selected}
+    # JSearch jobs from unrecognized publishers (e.g. "bebee", "recruit.net") are
+    # redistributed round-robin among selected JSearch platforms so they aren't lost.
+    jsearch_overflow: list = []
+    jsearch_overflow_idx = 0
+
+    for i, platform_results in enumerate(all_platform_results):
         if isinstance(platform_results, Exception):
             print(f"[Search] Platform error: {platform_results}")
             continue
-        platform_lists.append(platform_results)
+        expected = task_platform[i]   # None for JSearch, platform name otherwise
+        for job in platform_results:
+            url = job.get("job_url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if expected is None:
+                # JSearch — trust the job's "platform" field (set by _parse_job)
+                actual = job.get("platform", "").lower()
+                if actual in buckets:
+                    buckets[actual].append(job)
+                elif jsearch_platforms:
+                    # Unrecognized publisher (e.g. "bebee") — keep and redistribute
+                    jsearch_overflow.append(job)
+            else:
+                # CSE or Remotive — use the known expected platform
+                if expected in buckets:
+                    buckets[expected].append(job)
 
-    raw_jobs = []
-    max_len = max((len(pl) for pl in platform_lists), default=0)
-    for i in range(max_len):
-        for pl in platform_lists:
-            if i < len(pl):
-                job = pl[i]
-                url = job.get("job_url", "")
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    raw_jobs.append(job)
+    # Distribute unrecognized JSearch jobs round-robin across selected JSearch platforms
+    for job in jsearch_overflow:
+        target = jsearch_platforms[jsearch_overflow_idx % len(jsearch_platforms)]
+        job["platform"] = target
+        buckets[target].append(job)
+        jsearch_overflow_idx += 1
+
+    print(f"\n[Buckets after collection]")
+    for p, jobs in buckets.items():
+        print(f"  {p}: {len(jobs)} raw jobs")
+    print(f"  jsearch_overflow redistributed: {jsearch_overflow_idx} jobs")
+
+    raw_jobs = [job for jobs_list in buckets.values() for job in jobs_list]
+    print(f"[Total raw_jobs to score]: {len(raw_jobs)}")
 
     if not raw_jobs:
         return JobSearchResponse(
@@ -167,8 +310,7 @@ async def search_jobs(req: JobSearchRequest):
             searched_at=datetime.now(timezone.utc)
         )
 
-    # 6. Score ALL collected jobs so results from every platform are ranked fairly.
-    #    (Truncating before scoring would cause only the first platform's jobs to appear.)
+    # 6. Score ALL raw jobs so every platform's candidates are ranked fairly.
     scored_jobs = await _score_jobs_parallel(
         raw_jobs,
         candidate_role,
@@ -176,9 +318,47 @@ async def search_jobs(req: JobSearchRequest):
         experience_years
     )
 
-    # 7. Sort by match score descending, then take top num_results
-    scored_jobs.sort(key=lambda j: j.get("match_score", 0), reverse=True)
-    scored_jobs = scored_jobs[:req.num_results]
+    # 7. Enforce strict per-platform quota with experience-level post-filter:
+    #    - Re-bucket scored jobs by platform, dropping those that don't match
+    #      the requested experience level (checked via regex on title+description).
+    #    - Take the top per_platform (by score) from each selected platform.
+    #    - If a platform delivered fewer than its quota, fill the gap from
+    #      other platforms' overflow (highest-scoring extras first).
+    exp_level = req.experience_level.value
+    scored_buckets: dict = {p: [] for p in platforms_selected}
+    exp_filtered_out = 0
+    for job in scored_jobs:
+        p = job.get("platform", "")
+        if p in scored_buckets:
+            if _experience_matches(job, exp_level):
+                scored_buckets[p].append(job)
+            else:
+                exp_filtered_out += 1
+
+    print(f"\n[After experience filter ({exp_level})] removed={exp_filtered_out}")
+    for p, jobs in scored_buckets.items():
+        print(f"  {p}: {len(jobs)} jobs  (quota per platform: {per_platform})")
+
+    final_jobs: list = []
+    overflow:   list = []
+    for platform in platforms_selected:
+        bucket = sorted(scored_buckets[platform],
+                        key=lambda j: j.get("match_score", 0), reverse=True)
+        taken = bucket[:per_platform]
+        final_jobs.extend(taken)
+        overflow.extend(bucket[per_platform:])
+        print(f"  → {platform}: took {len(taken)} / {len(bucket)} available")
+
+    # Fill remaining slots from overflow (any platform that had extras)
+    if len(final_jobs) < req.num_results:
+        overflow.sort(key=lambda j: j.get("match_score", 0), reverse=True)
+        needed = req.num_results - len(final_jobs)
+        fill = overflow[:needed]
+        final_jobs.extend(fill)
+        print(f"  → overflow fill: +{len(fill)} jobs  (needed {needed})")
+
+    print(f"\n[Final] returning {len(final_jobs)} / {req.num_results} requested")
+    scored_jobs = final_jobs
 
     # 8. Save to jobs_cache + job_assignments
     saved_jobs = await _save_jobs_to_cache(

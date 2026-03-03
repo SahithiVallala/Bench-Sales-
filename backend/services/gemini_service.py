@@ -13,15 +13,27 @@ load_dotenv()
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 
-# Model priority: try best available, fall back automatically
-# gemini-flash-lite-latest = alias that always points to the latest working flash lite
-_model = genai.GenerativeModel("gemini-flash-lite-latest")
+# gemini-1.5-flash free tier: 1,500 requests/day (vs 20/day for flash-lite)
+# This ensures AI scoring works for full job searches without hitting quota.
+_MODEL_NAME = "gemini-1.5-flash"
+_model = genai.GenerativeModel(_MODEL_NAME)
+_quota_exceeded = False   # set True once we detect a 429 to stop retrying
 
 
 def _call_gemini(prompt: str) -> str:
     """Make a Gemini API call and return raw text response."""
-    response = _model.generate_content(prompt)
-    return response.text.strip()
+    global _quota_exceeded
+    if _quota_exceeded:
+        raise RuntimeError("Gemini quota exceeded for today")
+    try:
+        response = _model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        msg = str(e).lower()
+        if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
+            _quota_exceeded = True
+            print(f"[Gemini] Quota exceeded on {_MODEL_NAME} — keyword fallback active for rest of session")
+        raise
 
 
 def _extract_json(text: str) -> dict:
@@ -36,6 +48,165 @@ def _extract_json(text: str) -> dict:
         if match:
             return json.loads(match.group())
         return {}
+
+
+# ── Contact Extraction ─────────────────────────────────────────────────────────
+
+# US state abbreviations used by location regex
+_US_STATES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
+    "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
+    "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
+    "TX","UT","VT","VA","WA","WV","WI","WY","DC","PR",
+}
+
+
+def _regex_email(text: str) -> Optional[str]:
+    match = re.search(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', text)
+    return match.group(0).lower() if match else None
+
+
+def _regex_phone(text: str) -> Optional[str]:
+    match = re.search(
+        r'(?:\+?1[\s.\-]?)?'
+        r'(?:\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}'
+        r'|\+\d{1,3}[\s.\-]?\d{6,12})',
+        text
+    )
+    return match.group(0).strip() if match else None
+
+
+def _regex_name(text: str) -> Optional[str]:
+    """
+    Heuristic: the candidate's name is almost always the first non-empty line
+    of the resume that looks like a proper name (2-4 title-cased words, no
+    digits or special characters).
+    """
+    lines = [l.strip() for l in text[:800].splitlines() if l.strip()]
+    for line in lines[:8]:
+        # Skip lines that look like contact info, URLs, or section headers
+        if re.search(r'[@\d/|#*\\]', line):
+            continue
+        if re.search(
+            r'(?i)(resume|curriculum vitae|\bcv\b|objective|summary|profile|'
+            r'linkedin|github|http|www\.|skills|education|experience)',
+            line
+        ):
+            continue
+        words = line.split()
+        # Name: 2-4 words, each starting uppercase, letters/apostrophe/hyphen only
+        if 2 <= len(words) <= 4 and all(
+            re.match(r"^[A-Z][a-zA-Z'\-\.]{0,20}$", w) for w in words
+        ):
+            return line
+    return None
+
+
+def _regex_location(text: str) -> Optional[str]:
+    """
+    Extract city/state or city/country from the top section of the resume.
+    Prioritises US 'City, ST' patterns, then falls back to 'City, Country'.
+    """
+    top = text[:1200]
+
+    # US pattern: "Austin, TX" or "New York, NY 10001"
+    for m in re.finditer(
+        r'\b([A-Z][a-zA-Z](?:[a-zA-Z\s]{0,18}[a-zA-Z])?),\s*([A-Z]{2})\b',
+        top
+    ):
+        city, state = m.group(1).strip(), m.group(2)
+        if state in _US_STATES and len(city) >= 3:
+            return f"{city}, {state}"
+
+    # International / spelled-out state: "Hyderabad, India" / "Chicago, Illinois"
+    m = re.search(
+        r'\b([A-Z][a-zA-Z]{2,20}(?:\s[A-Z][a-zA-Z]{2,15})?),\s*([A-Z][a-zA-Z]{3,20})\b',
+        top
+    )
+    if m:
+        loc = f"{m.group(1).strip()}, {m.group(2).strip()}"
+        # Avoid false positives like university/company names
+        if not re.search(
+            r'(?i)(university|college|institute|school|corp|inc|ltd|llc|pvt)',
+            loc
+        ):
+            return loc
+
+    return None
+
+
+def extract_contact_info(resume_text: str) -> dict:
+    """
+    Extract full name, email, phone, and location from resume text.
+
+    Strategy (in priority order):
+      1. Regex for all four fields — fast, uses zero AI quota
+      2. ONE Gemini call for any fields still missing — only fires when needed
+
+    This keeps Gemini usage to ≤1 call per upload instead of 2-3.
+    """
+    top = resume_text[:1200].strip()
+
+    # ── Step 1: regex pass ────────────────────────────────────────────────────
+    full_name = _regex_name(top)
+    email     = _regex_email(top)
+    phone     = _regex_phone(top)
+    location  = _regex_location(top)
+
+    print(f"[Contact] Regex found — name:{bool(full_name)} email:{bool(email)} "
+          f"phone:{bool(phone)} location:{bool(location)}")
+
+    # ── Step 2: ONE Gemini call for whatever is still missing ─────────────────
+    missing = [f for f, v in [
+        ("full_name", full_name), ("email", email),
+        ("phone", phone), ("location", location)
+    ] if not v]
+
+    if missing:
+        try:
+            prompt = f"""Extract the following fields from the top of this resume.
+Return ONLY a valid JSON object — no explanation, no markdown.
+
+Fields to extract: {', '.join(missing)}
+
+JSON format:
+{{
+  "full_name": "First Last or null",
+  "email": "email@example.com or null",
+  "phone": "+1 (555) 000-0000 or null",
+  "location": "City, State or City, Country or null"
+}}
+
+Rules:
+- full_name: the candidate's own name, usually the very first line
+- location: city + state/country only (e.g. "Austin, TX" or "Bangalore, India")
+- Return null for any field you cannot find
+
+Resume header:
+---
+{top}
+---
+Return only the JSON:"""
+            raw  = _call_gemini(prompt)
+            data = _extract_json(raw)
+            if not full_name:
+                full_name = data.get("full_name") or None
+            if not email:
+                email = data.get("email") or None
+            if not phone:
+                phone = data.get("phone") or None
+            if not location:
+                location = data.get("location") or None
+            print(f"[Contact] Gemini filled: {missing}")
+        except Exception as e:
+            print(f"[Gemini] Contact extraction error: {e}")
+
+    return {
+        "full_name": full_name,
+        "email":     email,
+        "phone":     phone,
+        "location":  location,
+    }
 
 
 # ── Resume Parsing ─────────────────────────────────────────────────────────────
@@ -53,6 +224,9 @@ No explanation, no markdown — just the JSON.
 
 Required JSON structure:
 {{
+  "full_name": "candidate's full name from the top of the resume",
+  "email": "email address found in the resume, or null",
+  "phone": "phone number found in the resume, or null",
   "primary_role": "most recent/primary job title",
   "primary_skills": ["skill1", "skill2", ...],
   "secondary_skills": ["skill1", "skill2", ...],
@@ -64,6 +238,7 @@ Required JSON structure:
 }}
 
 Rules:
+- full_name: the candidate's own name, usually the first line of the resume
 - primary_skills: top 6-8 most relevant technical skills
 - secondary_skills: additional tools, frameworks, soft skills (max 8)
 - experience_years: total years of professional experience as a decimal

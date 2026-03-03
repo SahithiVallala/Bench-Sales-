@@ -27,9 +27,9 @@ PUBLISHER_TO_PLATFORM = {
 }
 
 EXPERIENCE_LEVEL_KEYWORDS = {
-    "entry":  "entry level",
+    "entry":  "entry level junior",
     "mid":    "mid level",
-    "senior": "senior level",
+    "senior": "senior lead",
 }
 
 DATE_POSTED_MAP = {
@@ -147,7 +147,9 @@ async def search_platform(
                     break
 
     except Exception as e:
-        print(f"[JSearch] Request error: {e}")
+        import traceback
+        print(f"[JSearch] Request error ({type(e).__name__}): {e}")
+        traceback.print_exc()
 
     return results
 
@@ -199,8 +201,9 @@ async def search_platforms_combined(
 
     query = " ".join(query_parts)
 
-    # Request extra pages so we have enough after publisher filtering
-    num_pages = min(max((num_results + 9) // 10, 2), 3)
+    # Request extra pages so we have enough after publisher filtering.
+    # Cap raised to 5 (50 results) — JSearch free tier allows this.
+    num_pages = min(max((num_results + 9) // 10, 2), 5)
 
     params = {
         "query":       query,
@@ -222,24 +225,29 @@ async def search_platforms_combined(
     }
 
     print(f"[JSearch] Combined query for {platforms}: {query}")
+    print(f"[JSearch] Params: {params}")
 
     raw_data = []
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             resp = await client.get(JSEARCH_URL, params=params, headers=headers)
 
+            print(f"[JSearch] HTTP status: {resp.status_code}")
             if resp.status_code == 429:
                 print("[JSearch] Rate limit hit")
                 return []
             if resp.status_code != 200:
-                print(f"[JSearch] Error {resp.status_code}: {resp.text[:200]}")
+                print(f"[JSearch] Error {resp.status_code}: {resp.text[:500]}")
                 return []
 
-            raw_data = resp.json().get("data", [])
+            resp_json = resp.json()
+            raw_data = resp_json.get("data") or []
             print(f"[JSearch] Raw jobs from API: {len(raw_data)}")
 
     except Exception as e:
-        print(f"[JSearch] Request error: {e}")
+        import traceback
+        print(f"[JSearch] Request error ({type(e).__name__}): {e}")
+        traceback.print_exc()
         return []
 
     # Build set of requested platform names (lowercase)

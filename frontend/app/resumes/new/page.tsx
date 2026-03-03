@@ -6,14 +6,19 @@ const VISA_OPTIONS = ['H1B', 'OPT', 'GC', 'USC', 'TN', 'EAD', 'CPT', 'Other']
 const WORK_AUTH_OPTIONS = ['W2', 'C2C', '1099', 'Any']
 const WORK_MODE_OPTIONS = ['any', 'remote', 'hybrid', 'onsite']
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
 export default function NewResumePage() {
   const router = useRouter()
   const fileRef = useRef<HTMLInputElement>(null)
 
   const [file, setFile] = useState<File | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [dragOver, setDragOver] = useState(false)
+  const [parsing, setParsing]       = useState(false)   // extracting contact info
+  const [error, setError]           = useState<string | null>(null)
+  const [dragOver, setDragOver]     = useState(false)
+  // Which fields were auto-filled (show subtle highlight so user knows)
+  const [autoFilled, setAutoFilled] = useState<Set<string>>(new Set())
 
   const [form, setForm] = useState({
     candidate_name: '',
@@ -26,8 +31,11 @@ export default function NewResumePage() {
     work_mode_pref: 'any',
   })
 
-  const set = (field: string, value: any) =>
+  const set = (field: string, value: any) => {
     setForm(prev => ({ ...prev, [field]: value }))
+    // If user manually edits an auto-filled field, remove the highlight
+    setAutoFilled(prev => { const n = new Set(prev); n.delete(field); return n })
+  }
 
   const isValidFile = (f: File) =>
     f.type === 'application/pdf' ||
@@ -35,17 +43,66 @@ export default function NewResumePage() {
     f.name.toLowerCase().endsWith('.doc') ||
     f.name.toLowerCase().endsWith('.docx')
 
+  /** Called whenever a valid file is selected — extracts contact info automatically */
+  const handleFileSelected = async (f: File) => {
+    setFile(f)
+    setError(null)
+    setParsing(true)
+
+    try {
+      const fd = new FormData()
+      fd.append('file', f)
+      const res = await fetch(`${API_BASE}/api/resumes/extract-contact`, {
+        method: 'POST',
+        body: fd,
+      })
+
+      if (!res.ok) throw new Error('Contact extraction failed')
+
+      const contact = await res.json()
+      const filled = new Set<string>()
+
+      setForm(prev => {
+        const next = { ...prev }
+        // Only auto-fill fields that are currently empty
+        if (!prev.candidate_name.trim() && contact.full_name) {
+          next.candidate_name = contact.full_name
+          filled.add('candidate_name')
+        }
+        if (!prev.email.trim() && contact.email) {
+          next.email = contact.email
+          filled.add('email')
+        }
+        if (!prev.phone.trim() && contact.phone) {
+          next.phone = contact.phone
+          filled.add('phone')
+        }
+        if (!prev.current_location.trim() && contact.location) {
+          next.current_location = contact.location
+          filled.add('current_location')
+        }
+        return next
+      })
+      setAutoFilled(filled)
+    } catch (err) {
+      // Non-critical — user can still fill manually
+      console.warn('Contact extraction failed, user can fill manually:', err)
+    } finally {
+      setParsing(false)
+    }
+  }
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault()
     setDragOver(false)
     const dropped = e.dataTransfer.files[0]
-    if (dropped && isValidFile(dropped)) setFile(dropped)
+    if (dropped && isValidFile(dropped)) handleFileSelected(dropped)
     else setError('Only PDF and Word (.docx) files are accepted.')
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!file) { setError('Please upload a resume file.'); return }
+    if (!file)                    { setError('Please upload a resume file.'); return }
     if (!form.candidate_name.trim()) { setError('Candidate name is required.'); return }
 
     setSubmitting(true)
@@ -56,10 +113,7 @@ export default function NewResumePage() {
     Object.entries(form).forEach(([k, v]) => body.append(k, String(v)))
 
     try {
-      const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/resumes`,
-        { method: 'POST', body }
-      )
+      const res = await fetch(`${API_BASE}/api/resumes`, { method: 'POST', body })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }))
         throw new Error(err.detail || 'Upload failed')
@@ -73,6 +127,10 @@ export default function NewResumePage() {
     }
   }
 
+  /** Shared input class — highlights auto-filled fields with a subtle teal ring */
+  const inputClass = (field: string) =>
+    `input transition-all ${autoFilled.has(field) ? 'ring-1 ring-teal-500/60 bg-teal-950/10' : ''}`
+
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       {/* Header */}
@@ -81,11 +139,11 @@ export default function NewResumePage() {
           ← Back
         </button>
         <h1 className="text-2xl font-bold text-white">Add Bench Candidate</h1>
-        <p className="text-sm text-gray-400 mt-1">Upload resume — AI will automatically extract skills and experience.</p>
+        <p className="text-sm text-gray-400 mt-1">Upload resume — AI will automatically extract name, contact info, skills and experience.</p>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-5">
-        {/* PDF Upload */}
+        {/* File Upload */}
         <div
           onDragOver={e => { e.preventDefault(); setDragOver(true) }}
           onDragLeave={() => setDragOver(false)}
@@ -93,57 +151,83 @@ export default function NewResumePage() {
           onClick={() => fileRef.current?.click()}
           className={`cursor-pointer border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
             dragOver ? 'border-blue-500 bg-blue-950/30' :
-            file ? 'border-green-600 bg-green-950/20' :
-            'border-gray-700 hover:border-gray-500'
+            file      ? 'border-green-600 bg-green-950/20' :
+                        'border-gray-700 hover:border-gray-500'
           }`}
         >
           <input ref={fileRef} type="file" accept=".pdf,.doc,.docx" className="hidden"
             onChange={e => {
               const f = e.target.files?.[0]
-              if (f && isValidFile(f)) { setFile(f); setError(null) }
+              if (f && isValidFile(f)) handleFileSelected(f)
               else if (f) setError('Only PDF and Word (.docx) files are accepted.')
             }} />
+
           {file ? (
             <div>
               <div className="text-2xl mb-2">📄</div>
               <p className="text-sm text-green-400 font-medium">{file.name}</p>
               <p className="text-xs text-gray-500 mt-1">{(file.size / 1024).toFixed(0)} KB — click to change</p>
+              {parsing && (
+                <p className="text-xs text-teal-400 mt-2 animate-pulse">
+                  ⟳ Extracting contact info from resume...
+                </p>
+              )}
             </div>
           ) : (
             <div>
               <div className="text-3xl mb-2">📤</div>
               <p className="text-sm text-gray-300 font-medium">Drop PDF or Word file here or click to browse</p>
-              <p className="text-xs text-gray-500 mt-1">PDF or .docx, max 10MB</p>
+              <p className="text-xs text-gray-500 mt-1">PDF or .docx, max 10MB — name & contact will be auto-detected</p>
             </div>
           )}
         </div>
 
+        {/* Auto-fill notice */}
+        {autoFilled.size > 0 && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-teal-950/40 border border-teal-800/50 rounded-lg text-xs text-teal-400">
+            ✓ Auto-filled {autoFilled.size} field{autoFilled.size > 1 ? 's' : ''} from resume — review and edit if needed.
+          </div>
+        )}
+
         {/* Candidate Info */}
         <div className="card space-y-4">
-          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Candidate Info</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Candidate Info</h2>
+            {parsing && (
+              <span className="text-xs text-teal-400 animate-pulse">Parsing resume...</span>
+            )}
+          </div>
 
           <div>
             <label className="label">Full Name *</label>
-            <input required value={form.candidate_name}
+            <input
+              required
+              value={form.candidate_name}
               onChange={e => set('candidate_name', e.target.value)}
-              placeholder="e.g. John Smith"
-              className="input" />
+              placeholder={parsing ? 'Extracting from resume...' : 'e.g. John Smith'}
+              className={inputClass('candidate_name')}
+            />
           </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="label">Email</label>
-              <input type="email" value={form.email}
+              <input
+                type="email"
+                value={form.email}
                 onChange={e => set('email', e.target.value)}
-                placeholder="john@email.com"
-                className="input" />
+                placeholder={parsing ? 'Extracting...' : 'john@email.com'}
+                className={inputClass('email')}
+              />
             </div>
             <div>
               <label className="label">Phone</label>
-              <input value={form.phone}
+              <input
+                value={form.phone}
                 onChange={e => set('phone', e.target.value)}
-                placeholder="+1 (555) 000-0000"
-                className="input" />
+                placeholder={parsing ? 'Extracting...' : '+1 (555) 000-0000'}
+                className={inputClass('phone')}
+              />
             </div>
           </div>
 
@@ -151,8 +235,8 @@ export default function NewResumePage() {
             <label className="label">Current Location</label>
             <input value={form.current_location}
               onChange={e => set('current_location', e.target.value)}
-              placeholder="e.g. Austin, TX"
-              className="input" />
+              placeholder={parsing ? 'Extracting...' : 'e.g. Austin, TX'}
+              className={inputClass('current_location')} />
           </div>
         </div>
 
@@ -216,11 +300,15 @@ export default function NewResumePage() {
             className="px-4 py-2.5 text-sm text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded-lg transition-colors">
             Cancel
           </button>
-          <button type="submit" disabled={submitting}
+          <button type="submit" disabled={submitting || parsing}
             className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition-colors">
             {submitting ? (
               <span className="flex items-center justify-center gap-2">
                 <span className="animate-spin">⟳</span> Uploading & Parsing Resume...
+              </span>
+            ) : parsing ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin">⟳</span> Extracting contact info...
               </span>
             ) : 'Upload & Parse Resume'}
           </button>
