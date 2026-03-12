@@ -4,9 +4,9 @@ Job Search routes — multi-platform search with AI match scoring
 import asyncio
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
-from typing import List
+from typing import List, Optional
 
 from models.schemas import JobSearchRequest, JobSearchResponse, JobResult
 from services.supabase_client import get_supabase
@@ -14,6 +14,62 @@ from services import gemini_service
 from services.job_search import google_cse, jsearch, remotive
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+def _parse_relative_date(date_str: Optional[str]) -> Optional[str]:
+    """
+    Convert relative dates like "5 days ago", "18 hours ago" to ISO date strings.
+    Returns None if parsing fails or input is None/empty.
+    Already ISO-formatted dates (YYYY-MM-DD) are returned as-is.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    
+    date_str = date_str.strip().lower()
+    
+    # Already in ISO format (YYYY-MM-DD)?
+    if re.match(r'^\d{4}-\d{2}-\d{2}', date_str):
+        return date_str[:10]  # Return just the date part
+    
+    now = datetime.now(timezone.utc)
+    
+    # Match patterns like "5 days ago", "18 hours ago", "1 day ago", "2 weeks ago"
+    match = re.match(r'^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$', date_str)
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        
+        if unit == "second":
+            delta = timedelta(seconds=value)
+        elif unit == "minute":
+            delta = timedelta(minutes=value)
+        elif unit == "hour":
+            delta = timedelta(hours=value)
+        elif unit == "day":
+            delta = timedelta(days=value)
+        elif unit == "week":
+            delta = timedelta(weeks=value)
+        elif unit == "month":
+            delta = timedelta(days=value * 30)  # Approximate
+        elif unit == "year":
+            delta = timedelta(days=value * 365)  # Approximate
+        else:
+            return None
+        
+        return (now - delta).strftime("%Y-%m-%d")
+    
+    # Handle "today", "yesterday"
+    if date_str == "today":
+        return now.strftime("%Y-%m-%d")
+    if date_str == "yesterday":
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    # Handle "just now", "moments ago"
+    if date_str in ("just now", "moments ago", "now"):
+        return now.strftime("%Y-%m-%d")
+    
+    # Cannot parse — return None to skip this field
+    return None
 
 # Which API handles which platform
 # Note: Glassdoor is served via JSearch because Google search only returns
@@ -444,8 +500,10 @@ async def _save_jobs_to_cache(
                 "skills_required": job.get("skills_required", []),
                 "search_params":   search_params,
             }
-            if job.get("posted_date"):
-                cache_record["posted_date"] = job["posted_date"]
+            # Parse relative dates like "5 days ago" into ISO format
+            parsed_date = _parse_relative_date(job.get("posted_date"))
+            if parsed_date:
+                cache_record["posted_date"] = parsed_date
 
             cache_result = supabase.table("jobs_cache").upsert(
                 cache_record, on_conflict="job_url"
@@ -493,6 +551,56 @@ async def _save_jobs_to_cache(
             }))
 
     return result_jobs
+
+
+@router.post("/harvested")
+async def save_harvested_jobs(payload: dict):
+    """
+    Receive jobs harvested by the Chrome extension from LinkedIn/job boards.
+    Upserts into jobs_cache so they appear on the Job Search page.
+    """
+    jobs = payload.get("jobs", [])
+    if not jobs:
+        return {"saved": 0, "total": 0}
+
+    supabase = get_supabase()
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=7)
+
+    saved = 0
+    for job in jobs:
+        title = (job.get("title") or "").strip()
+        if not title:
+            continue
+
+        url = (job.get("url") or "").strip()
+        # Use URL path as external_id for deduplication
+        import hashlib
+        ext_id = hashlib.md5(url.encode()).hexdigest()[:16] if url else title[:40]
+
+        record = {
+            "platform":    job.get("platform", "linkedin"),
+            "external_id": ext_id,
+            "title":       title,
+            "company":     (job.get("company") or "").strip() or None,
+            "location":    (job.get("location") or "").strip() or None,
+            "url":         url or None,
+            "description": None,
+            "easy_apply":  bool(job.get("easy_apply", False)),
+            "remote":      "remote" in (job.get("location") or "").lower(),
+            "fetched_at":  now.isoformat(),
+            "expires_at":  expires.isoformat(),
+        }
+        try:
+            supabase.table("jobs_cache") \
+                .upsert(record, on_conflict="platform,external_id") \
+                .execute()
+            saved += 1
+        except Exception as e:
+            print(f"[Harvest] DB upsert error: {e}")
+
+    print(f"[Harvest] Saved {saved}/{len(jobs)} harvested jobs")
+    return {"saved": saved, "total": len(jobs)}
 
 
 @router.get("/{job_id}")

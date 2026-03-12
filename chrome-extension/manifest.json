@@ -1,0 +1,106 @@
+{
+  "manifest_version": 3,
+  "name": "Bench Sales Auto Apply",
+  "version": "1.0.0",
+  "description": "Automatically applies to jobs on LinkedIn, Indeed, ZipRecruiter, Naukri, Dice, and more. Powered by your bench sales platform.",
+
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage",
+    "scripting",
+    "notifications"
+  ],
+
+  "host_permissions": [
+    "https://www.linkedin.com/*",
+    "https://linkedin.com/*",
+    "https://www.indeed.com/*",
+    "https://indeed.com/*",
+    "https://www.ziprecruiter.com/*",
+    "https://ziprecruiter.com/*",
+    "https://www.naukri.com/*",
+    "https://naukri.com/*",
+    "https://www.dice.com/*",
+    "https://dice.com/*",
+    "https://*.myworkdayjobs.com/*",
+    "https://*.greenhouse.io/*",
+    "https://*.lever.co/*",
+    "http://localhost:8000/*",
+    "http://localhost:3000/*"
+  ],
+
+  "background": {
+    "service_worker": "background/serviceWorker.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:3000/*"],
+      "js": ["content/pageBridge.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.linkedin.com/*",
+        "https://linkedin.com/*",
+        "https://www.indeed.com/*",
+        "https://indeed.com/*",
+        "https://*.indeed.com/*",
+        "https://www.ziprecruiter.com/*",
+        "https://ziprecruiter.com/*",
+        "https://www.naukri.com/*",
+        "https://naukri.com/*",
+        "https://www.dice.com/*",
+        "https://dice.com/*",
+        "https://*.myworkdayjobs.com/*",
+        "https://*.greenhouse.io/*",
+        "https://*.lever.co/*",
+        "https://*.icims.com/*",
+        "https://*.smartrecruiters.com/*",
+        "https://*.taleo.net/*"
+      ],
+      "js": [
+        "utils/humanTyping.js",
+        "utils/fieldDetector.js",
+        "utils/apiClient.js",
+        "platformAdapters/linkedinAdapter.js",
+        "platformAdapters/indeedAdapter.js",
+        "platformAdapters/ziprecruiterAdapter.js",
+        "platformAdapters/naukriAdapter.js",
+        "platformAdapters/diceAdapter.js",
+        "platformAdapters/workdayAdapter.js",
+        "platformAdapters/greenhouseAdapter.js",
+        "platformAdapters/leverAdapter.js",
+        "content/modalDetector.js",
+        "content/formFiller.js",
+        "content/statusOverlay.js",
+        "content/mainAutomation.js",
+        "content/jobHarvester.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

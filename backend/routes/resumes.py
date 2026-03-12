@@ -39,15 +39,24 @@ async def extract_contact(file: UploadFile = File(...)):
 
 @router.post("")
 async def upload_resume(
-    file:             UploadFile = File(...),
-    candidate_name:   str        = Form(...),
-    email:            Optional[str] = Form(None),
-    phone:            Optional[str] = Form(None),
-    visa_status:      Optional[str] = Form(None),
-    work_auth:        Optional[str] = Form(None),
-    current_location: Optional[str] = Form(None),
-    relocation:       Optional[bool] = Form(False),
-    work_mode_pref:   Optional[str]  = Form("any"),
+    file:                    UploadFile = File(...),
+    candidate_name:          str        = Form(...),
+    email:                   Optional[str] = Form(None),
+    phone:                   Optional[str] = Form(None),
+    visa_status:             Optional[str] = Form(None),
+    work_auth:               Optional[str] = Form(None),
+    current_location:        Optional[str] = Form(None),
+    relocation:              Optional[bool] = Form(False),
+    work_mode_pref:          Optional[str]  = Form("any"),
+    # Job-application fields
+    linkedin_url:            Optional[str] = Form(None),
+    portfolio_url:           Optional[str] = Form(None),
+    city:                    Optional[str] = Form(None),
+    state:                   Optional[str] = Form(None),
+    zip_code:                Optional[str] = Form(None),
+    current_company:         Optional[str] = Form(None),
+    notice_period:           Optional[str] = Form(None),
+    cover_letter_template:   Optional[str] = Form(None),
 ):
     """Upload a resume (PDF or Word), parse it, extract data with AI, save to DB."""
     fname = file.filename.lower()
@@ -108,9 +117,17 @@ async def upload_resume(
         "visa_status":      visa_status,
         "work_auth":        work_auth,
         "current_location": current_location,
-        "relocation":       relocation,
-        "work_mode_pref":   work_mode_pref,
-        "file_name":        file.filename,
+        "relocation":              relocation,
+        "work_mode_pref":          work_mode_pref,
+        "linkedin_url":            linkedin_url,
+        "portfolio_url":           portfolio_url,
+        "city":                    city,
+        "state":                   state,
+        "zip_code":                zip_code,
+        "current_company":         current_company,
+        "notice_period":           notice_period,
+        "cover_letter_template":   cover_letter_template,
+        "file_name":               file.filename,
         "file_url":         file_url,
         "parsed_text":      parsed_text,
         "primary_role":     extracted.get("primary_role"),
@@ -133,12 +150,15 @@ async def upload_resume(
 
 @router.get("")
 async def list_resumes():
-    """List all saved resumes (summary view)."""
+    """List all saved resumes — returns all fields needed for auto-apply."""
     supabase = get_supabase()
     result = supabase.table("resumes") \
-        .select("id, candidate_name, email, primary_role, primary_skills, "
-                "experience_years, visa_status, work_auth, work_mode_pref, "
-                "current_location, file_name, created_at") \
+        .select("id, candidate_name, email, phone, primary_role, primary_skills, "
+                "secondary_skills, experience_years, visa_status, work_auth, work_mode_pref, "
+                "current_location, city, state, zip_code, relocation, "
+                "linkedin_url, portfolio_url, current_company, notice_period, "
+                "cover_letter_template, ai_summary, rate_expectation, "
+                "file_name, file_url, certifications, education, created_at") \
         .order("created_at", desc=True) \
         .execute()
     return result.data or []
@@ -160,9 +180,16 @@ async def get_resume(resume_id: str):
 
 @router.delete("/{resume_id}")
 async def delete_resume(resume_id: str):
-    """Delete a resume record (does not delete the storage file)."""
+    """Delete a resume and its linked submissions."""
     supabase = get_supabase()
-    result = supabase.table("resumes").delete().eq("id", resume_id).execute()
-    if not result.data:
+    # Verify resume exists first
+    check = supabase.table("resumes").select("id").eq("id", resume_id).single().execute()
+    if not check.data:
         raise HTTPException(404, "Resume not found")
+    # Delete linked submissions first (foreign key constraint)
+    supabase.table("submissions").delete().eq("resume_id", resume_id).execute()
+    # Delete linked job_assignments (has CASCADE but be explicit)
+    supabase.table("job_assignments").delete().eq("resume_id", resume_id).execute()
+    # Now delete the resume
+    supabase.table("resumes").delete().eq("id", resume_id).execute()
     return {"message": "Resume deleted"}

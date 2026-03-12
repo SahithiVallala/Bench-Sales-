@@ -9,7 +9,7 @@ import os
 
 load_dotenv()
 
-from routes import resumes, jobs, submissions, vendors, analytics
+from routes import resumes, jobs, submissions, analytics, extension, email
 
 app = FastAPI(
     title="Bench Sales Automation Platform",
@@ -17,15 +17,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS — allow Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL", "http://localhost:3000"),
-        "http://localhost:3000",
-        "http://localhost:3001",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,   # Must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,8 +29,9 @@ app.add_middleware(
 app.include_router(resumes.router)
 app.include_router(jobs.router)
 app.include_router(submissions.router)
-app.include_router(vendors.router)
 app.include_router(analytics.router)
+app.include_router(extension.router)
+app.include_router(email.router)
 
 
 @app.exception_handler(Exception)

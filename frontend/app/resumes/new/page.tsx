@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 const VISA_OPTIONS = ['H1B', 'OPT', 'GC', 'USC', 'TN', 'EAD', 'CPT', 'Other']
 const WORK_AUTH_OPTIONS = ['W2', 'C2C', '1099', 'Any']
 const WORK_MODE_OPTIONS = ['any', 'remote', 'hybrid', 'onsite']
+const NOTICE_PERIOD_OPTIONS = ['Immediate', '1 week', '2 weeks', '1 month', '2 months', '3 months']
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -29,6 +30,15 @@ export default function NewResumePage() {
     current_location: '',
     relocation: false,
     work_mode_pref: 'any',
+    // Job-application fields
+    linkedin_url: '',
+    portfolio_url: '',
+    city: '',
+    state: '',
+    zip_code: '',
+    current_company: '',
+    notice_period: '',
+    cover_letter_template: '',
   })
 
   const set = (field: string, value: any) => {
@@ -139,7 +149,7 @@ export default function NewResumePage() {
           ← Back
         </button>
         <h1 className="text-2xl font-bold text-white">Add Bench Candidate</h1>
-        <p className="text-sm text-gray-400 mt-1">Upload resume — AI will automatically extract name, contact info, skills and experience.</p>
+        <p className="text-sm text-gray-400 mt-1">Upload resume — AI will automatically extract name, contact info, skills and experience. Fill extra fields so the extension can auto-apply to jobs.</p>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-5">
@@ -231,12 +241,58 @@ export default function NewResumePage() {
             </div>
           </div>
 
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="label">Current Company</label>
+              <input value={form.current_company}
+                onChange={e => set('current_company', e.target.value)}
+                placeholder="e.g. TCS or Fresher"
+                className="input" />
+            </div>
+            <div>
+              <label className="label">Notice Period</label>
+              <select value={form.notice_period}
+                onChange={e => set('notice_period', e.target.value)}
+                className="input">
+                <option value="">Select...</option>
+                {NOTICE_PERIOD_OPTIONS.map(v => <option key={v} value={v}>{v}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Location */}
+        <div className="card space-y-4">
+          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Location</h2>
           <div>
-            <label className="label">Current Location</label>
+            <label className="label">Current Location (display)</label>
             <input value={form.current_location}
               onChange={e => set('current_location', e.target.value)}
               placeholder={parsing ? 'Extracting...' : 'e.g. Austin, TX'}
               className={inputClass('current_location')} />
+          </div>
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="label">City</label>
+              <input value={form.city}
+                onChange={e => set('city', e.target.value)}
+                placeholder="Austin"
+                className="input" />
+            </div>
+            <div>
+              <label className="label">State</label>
+              <input value={form.state}
+                onChange={e => set('state', e.target.value)}
+                placeholder="TX"
+                className="input" />
+            </div>
+            <div>
+              <label className="label">ZIP Code</label>
+              <input value={form.zip_code}
+                onChange={e => set('zip_code', e.target.value)}
+                placeholder="78701"
+                className="input" />
+            </div>
           </div>
         </div>
 
@@ -285,6 +341,44 @@ export default function NewResumePage() {
               </label>
             </div>
           </div>
+        </div>
+
+        {/* Online Profiles */}
+        <div className="card space-y-4">
+          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Online Profiles</h2>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="label">LinkedIn URL</label>
+              <input value={form.linkedin_url}
+                onChange={e => set('linkedin_url', e.target.value)}
+                placeholder="linkedin.com/in/username"
+                className="input" />
+            </div>
+            <div>
+              <label className="label">Portfolio / GitHub URL</label>
+              <input value={form.portfolio_url}
+                onChange={e => set('portfolio_url', e.target.value)}
+                placeholder="github.com/username"
+                className="input" />
+            </div>
+          </div>
+        </div>
+
+        {/* Cover Letter Template */}
+        <div className="card space-y-3">
+          <div>
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Cover Letter Template</h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Use <span className="text-blue-400 font-mono">[COMPANY]</span> and <span className="text-blue-400 font-mono">[JOB]</span> — the extension will auto-replace them when applying.
+            </p>
+          </div>
+          <textarea
+            value={form.cover_letter_template}
+            onChange={e => set('cover_letter_template', e.target.value)}
+            rows={5}
+            placeholder="Dear Hiring Manager at [COMPANY],&#10;&#10;I am excited to apply for the [JOB] position. With my background in..."
+            className="input resize-none"
+          />
         </div>
 
         {/* Error */}

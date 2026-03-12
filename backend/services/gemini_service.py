@@ -1,12 +1,15 @@
 """
 Google Gemini AI Service
 Handles: resume parsing, job match scoring, content generation
+Primary: Gemini Flash Lite  →  Fallback: Groq (LangChain ChatGroq)
 """
 import os
 import json
 import re
 from typing import Optional
 import google.generativeai as genai
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +21,14 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
 _MODEL_NAME = "gemini-1.5-flash"
 _model = genai.GenerativeModel(_MODEL_NAME)
 _quota_exceeded = False   # set True once we detect a 429 to stop retrying
+
+# Groq fallback client (sync via .invoke)
+_GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+_GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+_groq_client  = (
+    ChatGroq(api_key=_GROQ_API_KEY, model=_GROQ_MODEL, temperature=0, max_tokens=1024)
+    if _GROQ_API_KEY else None
+)
 
 
 def _call_gemini(prompt: str) -> str:
@@ -34,6 +45,23 @@ def _call_gemini(prompt: str) -> str:
             _quota_exceeded = True
             print(f"[Gemini] Quota exceeded on {_MODEL_NAME} — keyword fallback active for rest of session")
         raise
+
+
+def _call_groq(prompt: str) -> str:
+    """Make a synchronous Groq call via LangChain ChatGroq."""
+    if not _groq_client:
+        raise RuntimeError("GROQ_API_KEY not configured")
+    response = _groq_client.invoke([HumanMessage(content=prompt)])
+    return response.content.strip()
+
+
+def _call_ai(prompt: str) -> str:
+    """Try Gemini first; fall back to Groq on any error (quota, network, etc.)."""
+    try:
+        return _call_gemini(prompt)
+    except Exception as e:
+        print(f"[AI] Gemini failed, trying Groq fallback: {type(e).__name__}")
+        return _call_groq(prompt)
 
 
 def _extract_json(text: str) -> dict:
@@ -253,7 +281,7 @@ Resume Text:
 Return only the JSON:
 """
     try:
-        raw = _call_gemini(prompt)
+        raw = _call_ai(prompt)
         data = _extract_json(raw)
         # Ensure lists are always lists, not None
         for field in ["primary_skills", "secondary_skills", "certifications"]:
@@ -320,7 +348,7 @@ Scoring guide:
 Return only the JSON:
 """
     try:
-        raw = _call_gemini(prompt)
+        raw = _call_ai(prompt)
         data = _extract_json(raw)
         # Validate and clamp score
         score = int(data.get("match_score", 0))
@@ -389,7 +417,7 @@ Return ONLY a valid JSON object (no markdown):
 Return only the JSON:
 """
     try:
-        raw = _call_gemini(prompt)
+        raw = _call_ai(prompt)
         data = _extract_json(raw)
         return {
             "submission_note": data.get("submission_note", ""),
@@ -401,3 +429,160 @@ Return only the JSON:
             "submission_note": f"Please find attached the resume of {candidate_name} for the {job_title} position.",
             "candidate_pitch": f"{candidate_name} is an experienced {candidate_role} with {exp_str} of experience."
         }
+
+
+# ── JD Inbox — Email Parsing ────────────────────────────────────────────────────
+
+class GeminiService:
+    """Wrapper class exposing async methods for the JD Inbox feature."""
+
+    async def extract_jd_info(self, text: str) -> dict:
+        """
+        Parse a raw email/attachment body and extract structured JD information.
+        Returns: {title, company, skills, jd_text}
+        """
+        import asyncio
+        prompt = f"""You are an IT staffing recruiter. Extract structured information from the
+following job description email content.
+
+Return ONLY a valid JSON object (no markdown, no explanation):
+{{
+  "title": "extracted job title, or null if not found",
+  "company": "company/client name, or null if not found",
+  "skills": ["skill1", "skill2", ...],
+  "jd_text": "clean, readable version of the job description — remove email boilerplate, signatures, footers. Keep requirements, responsibilities, and qualifications."
+}}
+
+Rules:
+- skills: list up to 15 key technical skills, tools, or technologies required
+- jd_text: should be the clean JD only, 100-600 words; remove greetings, signatures, reply chains
+- If this does not look like a job description, return title=null and jd_text equal to the original text
+
+Email/Attachment Content:
+---
+{text[:6000]}
+---
+
+Return only the JSON:"""
+        try:
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(None, _call_ai, prompt)
+            data = _extract_json(raw)
+            if not isinstance(data.get("skills"), list):
+                data["skills"] = []
+            return {
+                "title":    data.get("title"),
+                "company":  data.get("company"),
+                "skills":   data.get("skills", []),
+                "jd_text":  data.get("jd_text") or text[:3000],
+            }
+        except Exception as e:
+            print(f"[Gemini] JD extraction error: {e}")
+            return {"title": None, "company": None, "skills": [], "jd_text": text[:3000]}
+
+    async def match_candidates_to_jd(self, jd_text: str, candidates: list) -> list:
+        """
+        Score each candidate against a JD and return a ranked list.
+
+        candidates: list of dicts with keys: id, candidate_name, primary_role,
+                    primary_skills, secondary_skills, experience_years, ai_summary
+        Returns: sorted list with match_score, matched_skills, missing_skills, summary
+        """
+        import asyncio
+
+        if not candidates:
+            return []
+
+        # Build a compact candidate summary to fit in one prompt
+        candidate_lines = []
+        for i, c in enumerate(candidates):
+            skills = (c.get("primary_skills") or []) + (c.get("secondary_skills") or [])
+            skills_str = ", ".join(skills[:12]) if skills else "not specified"
+            exp = c.get("experience_years")
+            exp_str = f"{exp}y" if exp else "?"
+            candidate_lines.append(
+                f"[{i}] {c.get('candidate_name', 'Unknown')} | {c.get('primary_role', 'Unknown')} | "
+                f"{exp_str} exp | Skills: {skills_str}"
+            )
+
+        candidates_block = "\n".join(candidate_lines)
+
+        prompt = f"""You are an expert IT recruiter. Score each candidate against the job description below.
+
+Job Description:
+---
+{jd_text[:3000]}
+---
+
+Candidates (index | name | role | exp | skills):
+{candidates_block}
+
+Return ONLY a valid JSON array (no markdown). Each element:
+{{
+  "index": <candidate index from above>,
+  "match_score": <integer 0-100>,
+  "matched_skills": ["skill1", ...],
+  "missing_skills": ["skill1", ...],
+  "summary": "1-2 sentence explanation of why this candidate matches or doesn't"
+}}
+
+Scoring guide:
+- 90-100: Perfect match — candidate has nearly all required skills and right experience level
+- 75-89:  Strong match — minor gaps, easy to train
+- 60-74:  Moderate match — some important gaps
+- 40-59:  Weak match — significant skill or domain mismatch
+- 0-39:   Poor match — wrong domain or level
+
+Return only the JSON array:"""
+
+        try:
+            loop = asyncio.get_event_loop()
+            raw = await loop.run_in_executor(None, _call_ai, prompt)
+
+            # Strip markdown fences
+            import re as _re
+            cleaned = _re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+            scores = json.loads(cleaned)
+            if not isinstance(scores, list):
+                raise ValueError("Expected JSON array")
+        except Exception as e:
+            print(f"[Gemini] Candidate matching error: {e}")
+            # Fallback: basic keyword scoring for each candidate
+            scores = []
+            jd_lower = jd_text.lower()
+            for i, c in enumerate(candidates):
+                skills = (c.get("primary_skills") or []) + (c.get("secondary_skills") or [])
+                matched = [s for s in skills if s.lower() in jd_lower]
+                missing = [s for s in skills if s.lower() not in jd_lower]
+                score = int(len(matched) / len(skills) * 100) if skills else 40
+                scores.append({
+                    "index": i,
+                    "match_score": score,
+                    "matched_skills": matched,
+                    "missing_skills": missing,
+                    "summary": f"Keyword match: {len(matched)}/{len(skills)} skills found in JD.",
+                })
+
+        # Map index back to candidate data
+        results = []
+        for s in scores:
+            idx = s.get("index")
+            if idx is None or idx >= len(candidates):
+                continue
+            c = candidates[idx]
+            results.append({
+                "resume_id":      c.get("id"),
+                "candidate_name": c.get("candidate_name"),
+                "primary_role":   c.get("primary_role"),
+                "match_score":    max(0, min(100, int(s.get("match_score", 0)))),
+                "matched_skills": s.get("matched_skills", []),
+                "missing_skills": s.get("missing_skills", []),
+                "summary":        s.get("summary", ""),
+            })
+
+        results.sort(key=lambda x: x["match_score"], reverse=True)
+        return results
+
+
+# Singleton instance for import by routes
+gemini_service_instance = GeminiService()

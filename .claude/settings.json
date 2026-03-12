@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c:*)",
+      "Bash(curl -s -H \"Origin: http://localhost:3000\" --max-time 15 -F \"file=@C:/Users/Public/test.pdf;type=application/pdf\" -F \"candidate_name=Test User\" http://localhost:8000/api/resumes)",
+      "Bash(curl -s -H \"Origin: http://localhost:3000\" --max-time 20 -F \"file=@C:/Users/Public/test.pdf;type=application/pdf\" -F \"candidate_name=Test User\" http://localhost:8000/api/resumes)",
+      "Bash(git init)",
+      "Bash(git remote add origin https://github.com/SahithiVallala/Bench-Sales-.git)"
+    ]
+  }
+}

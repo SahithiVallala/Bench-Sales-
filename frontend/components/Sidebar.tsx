@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { href: '/resumes',      label: 'Resumes',       icon: '📄' },
   { href: '/search',       label: 'Job Search',    icon: '🔍' },
   { href: '/submissions',  label: 'Submissions',   icon: '📬' },
+  { href: '/jd-inbox',     label: 'JD Inbox',      icon: '📧' },
   { href: '/vendors',      label: 'Vendors',       icon: '🏢' },
 ]
 

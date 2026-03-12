@@ -19,6 +19,9 @@ frontend/.env
 .env.local
 .env.production
 
+# OAuth token file (contains access/refresh tokens)
+backend/email_token.json
+
 # OS
 .DS_Store
 Thumbs.db
